@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Models (large binary files)
+Model/SAM/
+Model/SAM_LARGE_CHECKPOINTS/
+Model/Anomaly/
+*.pth
+*.onnx
+
+# Output results
+RESULT/
+
+# Processed images
+ProcessImage/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
