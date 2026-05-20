@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -109,15 +110,22 @@ def collect_hit_points(mask_bin, parallel_lines, step_pix, min_run):
 
 
 def compute_fill_level(hit_points, ref_lines):
-    """Return (median_hx, median_hy, fill_pct) or (None, None, None) if no hits."""
+    """Return (median_hx, median_hy, fill_pct, min_fill, max_fill) or Nones if no hits."""
     if not hit_points:
-        return None, None, None
-    xs       = [p[0] for p in hit_points]
-    ys       = [p[1] for p in hit_points]
+        return None, None, None, None, None
+    xs     = [p[0] for p in hit_points]
+    ys     = [p[1] for p in hit_points]
+
     hx_rep   = float(np.median(xs))
     hy_rep   = float(np.median(ys))
     avg_fill = estimate_fill_from_hit(hx_rep, hy_rep, ref_lines)
-    return hx_rep, hy_rep, avg_fill
+
+    min_idx  = int(np.argmin(xs))
+    max_idx  = int(np.argmax(xs))
+    min_fill = estimate_fill_from_hit(float(xs[min_idx]), float(ys[min_idx]), ref_lines)
+    max_fill = estimate_fill_from_hit(float(xs[max_idx]), float(ys[max_idx]), ref_lines)
+
+    return hx_rep, hy_rep, avg_fill, min_fill, max_fill
 
 
 def build_overlay_image(img_np, mask, hit_points, ref_lines, rep_pt, avg_fill):
@@ -347,6 +355,8 @@ class AnomalyResultSummary(BaseModel):
 class PredictionResponse(BaseModel):
     success:         bool
     fill_level:      Optional[float]
+    min_fill_level:  Optional[float] = None
+    max_fill_level:  Optional[float] = None
     num_hits:        int
     largest_area:    int
     forced_zero:     bool
@@ -434,6 +444,8 @@ async def predict_fill_level(
         image, img_np = load_image_from_bytes(image_bytes)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
+        t_start = time.perf_counter()
+
         # ---- Timestamp (single capture, reused for both filenames) ----
         now       = datetime.now()
         ts_date   = now.strftime("%Y%m%d")
@@ -514,11 +526,12 @@ async def predict_fill_level(
 
         # ---- 6. Fill level ----
         hx_rep = hy_rep = None
+        min_fill = max_fill = None
         if largest_area < AREA_THRESHOLD:
             avg_fill    = 0.0
             forced_zero = True
         else:
-            hx_rep, hy_rep, avg_fill = compute_fill_level(hit_points, ref_lines)
+            hx_rep, hy_rep, avg_fill, min_fill, max_fill = compute_fill_level(hit_points, ref_lines)
             forced_zero = False
 
         # ---- 7. Overlay ----
@@ -549,7 +562,9 @@ async def predict_fill_level(
             "container_type":  safe_container,
             "num_hits":        len(hit_points),
             "largest_area":    int(largest_area),
-            "avg_fill":        float(avg_fill) if avg_fill is not None else None,
+            "avg_fill":        float(avg_fill)  if avg_fill  is not None else None,
+            "min_fill":        float(min_fill)  if min_fill  is not None else None,
+            "max_fill":        float(max_fill)  if max_fill  is not None else None,
             "forced_zero":     forced_zero,
             "rep_point":       [hx_rep, hy_rep] if hx_rep is not None else None,
             "anomaly_results": anomaly_results_raw,
@@ -566,9 +581,13 @@ async def predict_fill_level(
             mask_clean, overlay_final, img_np, anomaly_results_raw, summary,
         )
 
+        print(f"  [TIMING] Total inference: {(time.perf_counter() - t_start) * 1000:.1f} ms")
+
         return PredictionResponse(
             success=True,
-            fill_level=float(avg_fill) if avg_fill is not None else None,
+            fill_level=float(avg_fill)  if avg_fill  is not None else None,
+            min_fill_level=float(min_fill) if min_fill is not None else None,
+            max_fill_level=float(max_fill) if max_fill is not None else None,
             num_hits=len(hit_points),
             largest_area=int(largest_area),
             forced_zero=forced_zero,
