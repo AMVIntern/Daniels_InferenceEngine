@@ -57,7 +57,7 @@ AREA_THRESHOLD = int(os.getenv("AREA_THRESHOLD", "30000"))
 ANOMALY_ENABLED       = os.getenv("ANOMALY_ENABLED", "true").lower() == "true"
 ANOMALY_MODEL_PATH    = os.getenv("ANOMALY_MODEL_PATH", os.path.join(os.path.dirname(__file__), "Model", "Anomaly", "yolox_m_washanomaly20MAY.onnx"))
 ANOMALY_MODEL_CLASSES = [c.strip() for c in os.getenv("ANOMALY_MODEL_CLASSES", "waste").split(",")]
-ANOMALY_CONF_THR      = float(os.getenv("ANOMALY_CONF_THR", "0.5"))
+ANOMALY_CONF_THR      = float(os.getenv("ANOMALY_CONF_THR", "0.30"))
 
 # ======================
 # GLOBAL STATE
@@ -166,18 +166,61 @@ def _warmup():
     print("  Warm-up complete — CUDA kernels ready")
 
 
-def _save_outputs(mask_dir, overlay_dir, output_dir, safe_name,
-                  mask_clean, overlay_final, summary: dict):
-    """Write mask PNG, overlay JPG, and summary JSON to disk (runs in thread pool)."""
+def _draw_anomaly_image(img_np_rgb: np.ndarray, anomaly_results: list) -> np.ndarray:
+    """
+    Draw all anomaly detections onto a copy of img_np_rgb.
+    Each AnomalyResult may carry multiple AnomalyDetection boxes.
+    """
+    vis = img_np_rgb.copy()
+    color = (255, 51, 51)   # red-ish in RGB
+
+    for result in anomaly_results:
+        for det in result.get("detections", []):
+            x1, y1, x2, y2 = det["bbox"]
+            label = f"{det['class_name']} {det['score']:.2f}"
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 3)
+
+            # Label chip above box
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            chip_y1 = max(0, y1 - th - 10)
+            chip_y2 = y1
+            cv2.rectangle(vis, (x1, chip_y1), (x1 + tw + 6, chip_y2), color, -1)
+            cv2.putText(vis, label, (x1 + 3, chip_y2 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Corner label: "No anomaly detected" when nothing found
+    all_clear = all(not r.get("detected", False) for r in anomaly_results)
+    if anomaly_results and all_clear:
+        cv2.putText(vis, "No anomaly detected", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 0), 2, cv2.LINE_AA)
+
+    return vis
+
+
+def _save_outputs(mask_dir, image_dir, output_dir, safe_name,
+                  mask_clean, overlay_final, img_np_rgb, anomaly_results_raw, summary: dict):
+    """
+    Write mask PNG, overlay JPG, anomaly visualisation JPG, and summary JSON.
+    overlay and anomaly images are both written into image_dir (yyyy/MM/dd/Barcode/).
+    Runs in a background thread — do not call directly from the async handler.
+    """
     try:
-        mask_path    = os.path.join(mask_dir,    f"{safe_name}_mask.png")
-        overlay_path = os.path.join(overlay_dir, f"{safe_name}_overlay.jpg")
-        summary_path = os.path.join(output_dir,  f"{safe_name}_summary.json")
+        mask_path    = os.path.join(mask_dir,  f"{safe_name}_mask.png")
+        overlay_path = os.path.join(image_dir, f"{safe_name}_overlay.jpg")
+        anomaly_path = os.path.join(image_dir, f"{safe_name}_anomaly.jpg")
+        summary_path = os.path.join(output_dir, f"{safe_name}_summary.json")
 
         Image.fromarray(mask_clean).save(mask_path)
         Image.fromarray(overlay_final).save(overlay_path, quality=95)
+
+        # Full image with anomaly boxes drawn
+        anomaly_vis = _draw_anomaly_image(img_np_rgb, anomaly_results_raw)
+        Image.fromarray(anomaly_vis).save(anomaly_path, quality=95)
+
         summary["mask_path"]    = mask_path
         summary["overlay_path"] = overlay_path
+        summary["anomaly_path"] = anomaly_path
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
     except Exception as exc:
@@ -292,6 +335,15 @@ class FillLine(BaseModel):
     p2:   List[int]    # [x, y]
 
 
+class AnomalyResultSummary(BaseModel):
+    """Slim anomaly result returned in the API response — no raw detections array."""
+    name:            str
+    detected:        bool
+    score:           float
+    class_name:      str
+    detection_count: int = 0
+
+
 class PredictionResponse(BaseModel):
     success:         bool
     fill_level:      Optional[float]
@@ -299,7 +351,7 @@ class PredictionResponse(BaseModel):
     largest_area:    int
     forced_zero:     bool
     rep_point:       Optional[List[float]]
-    anomaly_results: List[AnomalyResult] = []
+    anomaly_results: List[AnomalyResultSummary] = []
     barcode:         Optional[str] = None
     container_type:  Optional[str] = None
     output_path:     Optional[str] = None
@@ -330,8 +382,8 @@ async def predict_fill_level(
     Output images are saved asynchronously to OUTPUT_DIR on the server.
     """
     # Sanitise optional metadata fields up-front so they're safe for filenames
-    safe_barcode    = _sanitise_label(barcode)
-    safe_container  = _sanitise_label(container_type)
+    safe_barcode   = _sanitise_label(barcode,        fallback="No_Barcode")
+    safe_container = _sanitise_label(container_type, fallback="Unknown")
 
     try:
         # ---- Parse walls ----
@@ -382,10 +434,12 @@ async def predict_fill_level(
         image, img_np = load_image_from_bytes(image_bytes)
         img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        # ---- Filename stem ----
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        safe_name = f"{timestamp}_{safe_barcode}_{safe_container}_{unique_id}"
+        # ---- Timestamp (single capture, reused for both filenames) ----
+        now       = datetime.now()
+        ts_date   = now.strftime("%Y%m%d")
+        ts_time   = now.strftime("%H%M%S")
+        ts_ms     = now.strftime("%f")[:3]
+        safe_name = f"{ts_date}_{ts_time}_{ts_ms}_{safe_barcode}_{safe_container}"
 
         # ---- 1. YOLO detection ----
         bbox = None
@@ -404,16 +458,40 @@ async def predict_fill_level(
                 output_path=None, error="YOLO detected no content in image",
             )
 
-        # ---- 2. Anomaly detection (on YOLO crop) ----
-        anomaly_results = []
+        # ---- 2. Anomaly detection (YOLO crop) ----
+        # Crop the full image to the primary YOLO bbox, run anomaly on the crop,
+        # then translate returned bboxes back to full-image coordinates.
+        bx1, by1, bx2, by2 = bbox
+        img_crop_bgr = img_bgr[by1:by2, bx1:bx2]
+
+        anomaly_results: List[AnomalyResult] = []
         if anomaly_registry and len(anomaly_registry) > 0:
-            x1, y1, x2, y2 = bbox
-            crop = img_bgr[y1:y2, x1:x2]
-            if crop.size > 0:
-                anomaly_results = anomaly_registry.run_all(crop)
-                for r in anomaly_results:
-                    print(f"  Anomaly [{r.name}]: detected={r.detected}, "
-                          f"score={r.score:.2f}, class={r.class_name}")
+            anomaly_results = anomaly_registry.run_all(img_crop_bgr)
+            # Offset bboxes from crop-space → full-image-space
+            for r in anomaly_results:
+                for det in r.detections:
+                    det.bbox = [
+                        det.bbox[0] + bx1,
+                        det.bbox[1] + by1,
+                        det.bbox[2] + bx1,
+                        det.bbox[3] + by1,
+                    ]
+            for r in anomaly_results:
+                det_str = (f"{r.detection_count} box(es), top score={r.score:.2f}"
+                           if r.detected else "clear")
+                print(f"  Anomaly [{r.name}]: {det_str}")
+
+        anomaly_summaries = [
+            AnomalyResultSummary(
+                name=r.name,
+                detected=r.detected,
+                score=r.score,
+                class_name=r.class_name,
+                detection_count=r.detection_count,
+            )
+            for r in anomaly_results
+        ]
+        print("anomaly_summaries",anomaly_summaries)
 
         # ---- 3. SAM segmentation ----
         mask_clean, largest_area, mask_bin = segment_mask(
@@ -426,7 +504,7 @@ async def predict_fill_level(
             return PredictionResponse(
                 success=False, fill_level=None, num_hits=0,
                 largest_area=int(largest_area), forced_zero=False,
-                rep_point=None, anomaly_results=anomaly_results,
+                rep_point=None, anomaly_results=anomaly_summaries,
                 barcode=safe_barcode, container_type=safe_container,
                 output_path=None, error="Failed to generate parallel lines",
             )
@@ -451,10 +529,19 @@ async def predict_fill_level(
         )
 
         # ---- 8. Async file I/O ----
-        mask_dir    = os.path.join(OUTPUT_DIR, "masks")
-        overlay_dir = os.path.join(OUTPUT_DIR, "overlays")
-        os.makedirs(mask_dir,    exist_ok=True)
-        os.makedirs(overlay_dir, exist_ok=True)
+        # Masks stay in a flat folder; overlay + anomaly share a date/barcode hierarchy
+        mask_dir  = os.path.join(OUTPUT_DIR, "masks")
+        image_dir = os.path.join(
+            OUTPUT_DIR,
+            ts_date[:4],   # yyyy
+            ts_date[4:6],  # MM
+            ts_date[6:8],  # dd
+            safe_barcode,  # Barcode (or "No_Barcode")
+        )
+        os.makedirs(mask_dir,  exist_ok=True)
+        os.makedirs(image_dir, exist_ok=True)
+
+        anomaly_results_raw = [r.model_dump() for r in anomaly_results]
 
         summary = {
             "image":           file.filename,
@@ -465,17 +552,18 @@ async def predict_fill_level(
             "avg_fill":        float(avg_fill) if avg_fill is not None else None,
             "forced_zero":     forced_zero,
             "rep_point":       [hx_rep, hy_rep] if hx_rep is not None else None,
-            "anomaly_results": [r.model_dump() for r in anomaly_results],
+            "anomaly_results": anomaly_results_raw,
             "mask_path":       None,
             "overlay_path":    None,
+            "anomaly_path":    None,
         }
 
         loop = asyncio.get_running_loop()
         loop.run_in_executor(
             executor,
             _save_outputs,
-            mask_dir, overlay_dir, OUTPUT_DIR, safe_name,
-            mask_clean, overlay_final, summary,
+            mask_dir, image_dir, OUTPUT_DIR, safe_name,
+            mask_clean, overlay_final, img_np, anomaly_results_raw, summary,
         )
 
         return PredictionResponse(
@@ -485,7 +573,7 @@ async def predict_fill_level(
             largest_area=int(largest_area),
             forced_zero=forced_zero,
             rep_point=[hx_rep, hy_rep] if hx_rep is not None else None,
-            anomaly_results=anomaly_results,
+            anomaly_results=anomaly_summaries,
             barcode=safe_barcode,
             container_type=safe_container,
             output_path=OUTPUT_DIR,
