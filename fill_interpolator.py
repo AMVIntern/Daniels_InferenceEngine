@@ -2,23 +2,6 @@
 
 import numpy as np
 
-def point_line_signed_distance(px, py, x1, y1, x2, y2):
-    """Signed perpendicular distance from point P to line AB."""
-    A = np.array([x1, y1], float)
-    B = np.array([x2, y2], float)
-    P = np.array([px, py], float)
-
-    AB = B - A
-    AP = P - A
-
-    cross = AB[0]*AP[1] - AB[1]*AP[0]
-    length = np.linalg.norm(AB)
-
-    if length < 1e-6:
-        return None
-
-    return cross / length   # signed distance
-
 def estimate_fill_from_hit(hx, hy, ref_lines):
 
     # Step 1: compute x_mid for each fill line

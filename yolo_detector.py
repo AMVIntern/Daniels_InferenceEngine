@@ -112,12 +112,16 @@ def yolo_detect(img_bgr, sess, input_name, output_name,
 class YoloDetector:
     """Wraps YOLOX ONNX model for waste detection."""
 
-    def __init__(self, onnx_path, conf_thr=0.8, nms_thr=0.8):
+    def __init__(self, onnx_path, conf_thr=0.8, nms_thr=0.8, classes=None):
         print(f"Loading YOLO from: {onnx_path}")
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.sess = ort.InferenceSession(
             onnx_path,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+            sess_options=opts,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
+        active_provider  = self.sess.get_providers()[0]
         self.input_name  = self.sess.get_inputs()[0].name
         self.output_name = self.sess.get_outputs()[0].name
         shape = self.sess.get_inputs()[0].shape
@@ -125,7 +129,9 @@ class YoloDetector:
         self.grids, self.strides_arr = build_grids(self.in_h, self.in_w, YOLO_STRIDES)
         self.conf_thr = conf_thr
         self.nms_thr  = nms_thr
-        print(f"YOLO ready  (input {self.in_w}x{self.in_h})")
+        self.classes  = classes if classes is not None else YOLO_CLASSES
+        print(f"YOLO ready  (input {self.in_w}x{self.in_h}, "
+              f"classes={self.classes}, provider={active_provider})")
 
     def detect(self, img_bgr):
         """
@@ -136,5 +142,5 @@ class YoloDetector:
             img_bgr,
             self.sess, self.input_name, self.output_name,
             self.in_h, self.in_w, self.grids, self.strides_arr,
-            self.conf_thr, self.nms_thr, YOLO_CLASSES
+            self.conf_thr, self.nms_thr, self.classes,
         )
